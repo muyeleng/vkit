@@ -5,7 +5,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="1.3"
+VERSION="1.4"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
@@ -29,7 +29,7 @@ INITCWND_VALS="$STATE_DIR/initcwnd.vals"
 SELF_PATH="/usr/local/bin/netflow"
 LOCK_FILE="/var/lock/netflow.lock"
 
-# ── 视觉与排版 ──────────────────────────────────────────────────────────────
+# ── 视觉与排版 (Apple 极简风) ───────────────────────────────────────────────
 if [ -t 1 ]; then
   green=$'\033[0;32m'; red=$'\033[0;31m'; yellow=$'\033[0;33m'
   cyan=$'\033[0;36m';  dim=$'\033[2m';    bold=$'\033[1m'; plain=$'\033[0m'
@@ -41,12 +41,44 @@ ok(){   printf '  %s✓%s %s\n' "$green" "$plain" "$*"; }
 info(){ printf '  %s·%s %s\n' "$cyan"  "$plain" "$*"; }
 warn(){ printf '  %s!%s %s\n' "$yellow" "$plain" "$*" >&2; }
 die(){  printf '  %s✕%s %s\n' "$red"   "$plain" "$1" >&2; exit "${2:-1}"; }
-rule(){ printf '  %s─────────────────────────────────────────%s\n' "$dim" "$plain"; }
+rule(){ printf '  %s──────────────────────────────────────────────────────%s\n' "$dim" "$plain"; }
+
+# CJK 中英文混合宽度对齐计算 (确保表格双列严丝合缝)
+_dispw(){
+  printf '%s' "$1" | LC_ALL=C od -An -tu1 2>/dev/null | awk '
+    {for(i=1;i<=NF;i++){b=$i
+       if(b<128)            n++
+       else if(b<192)       continue
+       else if(b<224)       n++
+       else if(b==226){ nx=$(i+1); if(nx==148||nx==149){ n++; i+=2; continue } n+=2 }
+       else                 n+=2
+    }} END{print n+0}'
+}
+kv(){
+  local w; w=$(_dispw "$1")
+  local pad=$(( 18 - w )); [ "$pad" -lt 1 ] && pad=1
+  printf '  %s%s%*s%s%s\n' "$dim" "$1" "$pad" "" "$plain" "$2"
+}
 
 need_root(){ [ "$(id -u)" = 0 ] || die "请使用 root 权限运行"; }
 have_tty(){ : 2>/dev/null </dev/tty; }
 
-# 字符串匹配辅助函数 (避免在 set -o pipefail 下使用 grep -q 触发 SIGPIPE 141 错误)
+# 独立打印提示语并从 /dev/tty 读取，避免 2>/dev/null 吞掉 read -p 的提示文字
+prompt_input(){
+  local msg="$1" var=""
+  printf '%s' "$msg" >&2
+  read -r var 2>/dev/null </dev/tty || return 1
+  printf '%s' "$var"
+}
+
+pause_return(){
+  echo
+  drain_tty
+  printf "  %s按任意键返回主面板...%s" "$dim" "$plain" >&2
+  read -rsn1 2>/dev/null </dev/tty || read -r 2>/dev/null </dev/tty || true
+  echo
+}
+
 has_word(){
   case "$1" in
     "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
@@ -54,7 +86,11 @@ has_word(){
   esac
 }
 
-# 并发文件锁：防止多个 SSH 窗口同时运行破坏 qdisc 队列或快照
+first_or(){
+  local s="${1%%$'\n'*}"
+  if [ -n "$s" ]; then printf '%s' "$s"; else printf '%s' "$2"; fi
+}
+
 take_lock(){
   command -v flock >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
@@ -65,7 +101,6 @@ take_lock(){
   die "另一个 NetFlow 实例正在运行 (锁: $LOCK_FILE)"
 }
 
-# 清理终端输入缓冲残留，防止执行期间误触回车直接跳过结果页
 drain_tty(){ while read -rsn1 -t 0.05 2>/dev/null </dev/tty; do :; done; return 0; }
 
 is_posint(){
@@ -87,7 +122,6 @@ human_bytes(){
   else printf '%s B' "$b"; fi
 }
 
-# 自动注册本地快捷命令: 兼容本地文件运行与 bash <(curl ...) 管道运行
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac
@@ -205,10 +239,20 @@ TUNED_KEYS="
   vm.swappiness
 "
 
+# 从快照中读取指定键的原始值，用于状态对比展示
+snap_val(){
+  [ -f "$SNAPSHOT" ] || return 1
+  awk -F'=' -v k="$1" '
+    $1 ~ "^[[:space:]]*"k"[[:space:]]*$" {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      print $2; exit
+    }' "$SNAPSHOT"
+}
+
 take_snapshot(){
   mkdir -p "$STATE_DIR"
+  # 已有快照则静默跳过，永久保护第一次抓到的出厂原始状态
   [ -f "$SNAPSHOT" ] && return 0
-  # 防污染保护：若已有配置文件但快照意外丢失，先移除旧配置并重载系统默认参数，再抓取出厂基线
   if [ -f "$SYSCTL_FILE" ] || [ -f "$QDISC_SCRIPT" ]; then
     warn "检测到已有配置但缺少出厂快照，正在先还原系统默认值以提取纯净基线..."
     rm -f "$SYSCTL_FILE"
@@ -233,7 +277,7 @@ take_snapshot(){
     rm -f "$tmp"; die "快照不完整 (${got}/${want} 项), 已中止"
   fi
   mv -- "$tmp" "$SNAPSHOT" || { rm -f "$tmp"; die "快照落盘失败"; }
-  ok "已备份出厂基线"
+  ok "已建立出厂基线快照 ($SNAPSHOT)"
 }
 
 # ── 路由首包窗口 (initcwnd) 与持久化 ────────────────────────────────────────
@@ -502,6 +546,73 @@ EOF
   systemctl enable --now netflow-qdisc.service >/dev/null 2>&1
 }
 
+# ── 功能 2: 查看状态与出厂基线对比 (融合 tcpfit status + 快照对比) ──────────
+show_status(){
+  local iface; iface=$(detect_iface)
+  local cc def_q act_q shaper rmem_max rmem_def tmem backlog cwnd svc_state
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  def_q=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+  act_q=$(qdisc_root_kind "$iface"); [ -n "$act_q" ] || act_q="none"
+  shaper=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") || shaper=""
+  rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+  rmem_def=$(sysctl -n net.core.rmem_default 2>/dev/null || echo 0)
+  tmem=$(sysctl -n net.ipv4.tcp_mem 2>/dev/null | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024,$2*4/1024,$3*4/1024}')
+  backlog=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || echo "?")
+  cwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd [0-9]+' | awk '{print $2}')
+  svc_state=$(systemctl is-enabled netflow-qdisc.service 2>/dev/null || echo "未安装")
+
+  # 读取出厂快照用于同行对比
+  local orig_cc="" orig_rmem="" orig_tmem="" orig_backlog=""
+  if [ -f "$SNAPSHOT" ]; then
+    orig_cc=$(snap_val "net.ipv4.tcp_congestion_control")
+    local _orm; _orm=$(snap_val "net.core.rmem_max")
+    [ -n "$_orm" ] && orig_rmem=$(human_bytes "$_orm")
+    local _otm; _otm=$(snap_val "net.ipv4.tcp_mem")
+    [ -n "$_otm" ] && orig_tmem=$(echo "$_otm" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024,$2*4/1024,$3*4/1024}')
+    orig_backlog=$(snap_val "net.core.netdev_max_backlog")
+  fi
+
+  echo
+  printf "  %s当前参数与出厂对比%s\n" "$bold" "$plain"
+  rule
+  kv "内核版本"      "$(uname -r)"
+  kv "拥塞控制"      "${cc}${orig_cc:+  ${dim}(出厂: ${orig_cc})${plain}}"
+  kv "队列调度"      "当前 ${act_q} / 默认 ${def_q}"
+  if [ -n "$shaper" ]; then
+    local burst_kb; burst_kb=$(awk -v r="$shaper" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%.0f KB", v/1024}')
+    kv "端口限速"    "${green}${shaper} Mbps${plain}  ${dim}(HTB burst ${burst_kb} · 服务 ${svc_state})${plain}"
+  else
+    local target_bw=""
+    [ -f "$SYSCTL_FILE" ] && target_bw=$(sed -n 's/^# Target=\([0-9]*\)Mbps.*/\1/p' "$SYSCTL_FILE" 2>/dev/null || echo "")
+    if [ -n "$target_bw" ] && [ "$target_bw" -ge "$SHAPE_MAX_BW" ] 2>/dev/null; then
+      kv "端口限速"  "${green}无限制 · 纯 fq 满速释放${plain}  ${dim}(按 ${target_bw} Mbps 调优)${plain}"
+    else
+      kv "端口限速"  "未启用"
+    fi
+  fi
+  kv "最大缓冲区"    "$(human_bytes "$rmem_max")  ${dim}(初始默认 $(human_bytes "$rmem_def")${orig_rmem:+ · 出厂: ${orig_rmem}})${plain}"
+  kv "全局 TCP 内存" "${tmem}${orig_tmem:+  ${dim}(出厂: ${orig_tmem})${plain}}"
+  kv "网卡队列上限"  "${backlog}${orig_backlog:+  ${dim}(出厂: ${orig_backlog})${plain}}"
+  kv "首包窗口"      "${cwnd:-10 (系统默认)}"
+  kv "出厂快照"      "$([ -f "$SNAPSHOT" ] && echo "${green}已锁定${plain} ${dim}($SNAPSHOT)${plain}" || echo "${yellow}尚未生成 (首次调优时自动备份)${plain}")"
+
+  echo
+  printf "  %s系统健康度 (Health)%s\n" "$bold" "$plain"
+  rule
+  local snmp rt drops oom_cnt
+  snmp=$(awk '/^Tcp: [0-9]/{print $12, $13}' /proc/net/snmp 2>/dev/null || echo "")
+  rt=$(echo "$snmp" | awk '{if($1>0) printf "%.3f%%", $2*100/$1; else print "n/a"}')
+  drops=$(first_or "$(grep -oP 'dropped \K[0-9]+' <<<"$(tc -s class show dev "$iface" 2>/dev/null)")" "0")
+  oom_cnt=$(journalctl --since '-1 hour' 2>/dev/null | grep -c 'oom-kill' || true)
+
+  kv "累计重传率"    "${rt}  ${dim}(开机至今累计)${plain}"
+  kv "限速队列丢包"  "${drops}"
+  kv "物理内存"      "$(free -m | awk '/Mem:/{printf "已用 %s MB / 可用 %s MB / 共 %s MB", $3, $7, $2}')"
+  kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
+  kv "近 1 小时 OOM" "${oom_cnt:-0} 次"
+  rule
+}
+
 # ── 功能 1: 设定带宽与优化 (含 1000Mbps 智能分流) ───────────────────────────
 apply_tuning(){
   local input_bw; input_bw=$(strip_zeros "$1")
@@ -518,7 +629,6 @@ apply_tuning(){
   buf_def=$(calc_buf_default "$FIXED_ROLE" "$bdp")
   tcp_mem=$(calc_tcp_mem "$ram")
 
-  # 尊重现有 BBR 变种 (如 BBRv3)，否则加载 tcp_bbr 并持久化模块配置；若内核不支持则安全回退 cubic
   local cc avail_cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
   if [[ "$cc" != bbr* ]]; then
@@ -603,22 +713,22 @@ EOF
       sed -i "s%^[[:space:]]*${_k}[[:space:]]*=%# 内核不支持已注释: ${_k} =%" "$SYSCTL_FILE"
     fi
   done < "$SYSCTL_FILE"
-  ok "已应用内核吞吐优化 (Max Buffer: $(human_bytes "$buf_max"))"
 
-  # 路由首包窗口: >100M 开启 initcwnd 32; <=100M 保持默认 10 防打穿小水管令牌桶
+  local bdp_mb; bdp_mb=$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')
+  ok "已应用内核吞吐优化 (BDP: ${bdp_mb} -> Max Buffer: $(human_bytes "$buf_max"))"
+
   local _wif; _wif=$(route_field dev); [ -n "$_wif" ] || _wif="$iface"
   if [ "$input_bw" -gt 100 ]; then
     if route_set_initcwnd 32; then
       persist_initcwnd "$_wif" 32 || warn "initcwnd 仅本次生效，未找到可用的开机持久化入口"
-      ok "已开启首包加速窗口 (initcwnd 32)"
+      ok "已开启首包加速窗口 (initcwnd / initrwnd = 32)"
     fi
   else
     remove_initcwnd_persistence
     route_restore_windows "$_wif" 2>/dev/null || true
-    info "小带宽保护 (<=100 Mbps): 保持默认首包窗口防突发丢包"
+    info "小带宽保护 (<=100 Mbps): 保持默认首包窗口 (10) 防突发丢包"
   fi
 
-  # 方案 B 智能分流：>= 1000 Mbps 自动切换纯 fq 释放多队列极限；< 1000 Mbps 启用 HTB 精准限速
   if [ "$input_bw" -ge "$SHAPE_MAX_BW" ]; then
     systemctl disable --now netflow-qdisc.service >/dev/null 2>&1 || true
     rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
@@ -631,14 +741,17 @@ EOF
     local applied
     applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") || applied=""
     if [ -n "$applied" ] && awk -v a="$applied" -v r="$input_bw" 'BEGIN{exit !(a > r*0.99 && a < r*1.01)}' 2>/dev/null; then
-      ok "已锁定端口速率上限 (${applied} Mbps)"
+      ok "已锁定端口速率上限 (HTB ${applied} Mbps + fq pacing)"
     else
       warn "端口限速下发异常，请检查网卡状态: tc qdisc show dev $iface"
     fi
   fi
+
+  # 调优完成后直接展示完整状态与基线对比表
+  show_status
 }
 
-# ── 功能 2: 还原出厂设置 ────────────────────────────────────────────────────
+# ── 功能 3: 还原出厂设置 ────────────────────────────────────────────────────
 rollback_origin(){
   local iface; iface=$(detect_iface)
   echo
@@ -666,7 +779,7 @@ rollback_origin(){
       done
       route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null || true
     fi
-    ok "已按出厂基线还原内核参数与路由"
+    ok "已按出厂快照 ($SNAPSHOT) 还原全部内核参数与路由"
   else
     sysctl --system >/dev/null 2>&1 || true
     route_restore_windows "$iface" 2>/dev/null || true
@@ -679,7 +792,8 @@ rollback_origin(){
     def_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "fq_codel")
     qdisc_set_mq_leaves "$iface" "$def_qdisc" 2>/dev/null || true
   fi
-  ok "已移除端口流控队列"
+  ok "已移除端口流控队列，恢复出厂状态"
+  show_status
 }
 
 # ── 交互式主界面 (Apple 极简风) ─────────────────────────────────────────────
@@ -701,24 +815,25 @@ show_panel(){
       status_str="${yellow}已优化 · 限速未生效${plain} ${dim}(Buffer $(human_bytes "$buf"))${plain}"
     fi
   else
-    status_str="${yellow}出厂默认${plain}"
+    status_str="${yellow}出厂默认${plain} ${dim}(Buffer $(human_bytes "$buf"))${plain}"
   fi
 
   clear 2>/dev/null || true
   echo
-  printf "  ${bold}NetFlow${plain}                              ${dim}v%s${plain}\n" "$VERSION"
+  printf "  ${bold}NetFlow${plain}                                           ${dim}v%s${plain}\n" "$VERSION"
   rule
   printf "  状态    %s\n" "$status_str"
-  printf "  环境    %s MB · %s · %s\n" "$ram" "$cc" "$iface"
+  printf "  环境    %s MB · %s · %s · %s\n" "$ram" "$cc" "$iface" "$(uname -r)"
   rule
   echo
   printf "  ${bold}网络调控${plain}\n"
   printf "    1. 设定带宽与优化\n"
-  printf "    2. 还原出厂设置\n"
+  printf "    2. 查看状态与基线对比\n"
+  printf "    3. 还原出厂设置\n"
   echo
   printf "  ${bold}系统工具${plain}\n"
-  printf "    3. 配置内存压缩 (ZRAM)           ${dim}待添加${plain}\n"
-  printf "    4. 系统清理与维护                ${dim}待添加${plain}\n"
+  printf "    4. 配置内存压缩 (ZRAM)                        ${dim}待添加${plain}\n"
+  printf "    5. 系统清理与维护                             ${dim}待添加${plain}\n"
   echo
   printf "    0. 退出\n"
   echo
@@ -728,42 +843,52 @@ show_panel(){
 menu_loop(){
   need_root
   if ! have_tty; then
-    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | rollback>"
+    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | status | rollback>"
   fi
   take_lock
   self_install
   while true; do
     show_panel
     local choice=""
-    read -rp "  选择 [0-4]: " choice 2>/dev/null </dev/tty || exit 0
+    choice=$(prompt_input "  请选择 [0-5]: ") || exit 0
     case "$choice" in
       1)
         echo
+        # 仅在第一次运行（尚无快照）时显示备份说明；后续运行不再打扰
+        if [ ! -f "$SNAPSHOT" ]; then
+          info "首次运行：将在 $SNAPSHOT 建立出厂基线备份"
+          printf "    %s后续调整带宽仅覆盖优化参数，出厂备份永久保留，随时可一键还原。%s\n\n" "$dim" "$plain"
+        fi
+        printf "  %s提示：输入 <1000 开启 HTB 精准限速；输入 >=1000 挂载纯 fq 满速释放 (直接回车取消)%s\n" "$dim" "$plain"
         local bw=""
         while true; do
-          read -rp "  目标带宽 (Mbps): " bw 2>/dev/null </dev/tty || exit 0
+          bw=$(prompt_input "  目标带宽 (Mbps): ") || exit 0
+          [ -z "$bw" ] && break
           if is_posint "$bw" 1 100000; then
             apply_tuning "$bw"
+            pause_return
             break
           fi
-          warn "请输入正整数 (如 50、200；填 >=1000 自动启用纯 fq 满速模式)"
+          warn "请输入 1 ~ 100000 之间的正整数 (如 200、500、1000)"
         done
-        echo
-        drain_tty
-        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
         ;;
       2)
-        rollback_origin
-        echo
-        drain_tty
-        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
+        show_status
+        pause_return
         ;;
-      3|4)
+      3)
+        echo
+        local ans=""
+        ans=$(prompt_input "  确认还原至出厂默认状态？[y/N]: ") || exit 0
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+          rollback_origin
+          pause_return
+        fi
+        ;;
+      4|5)
         echo
         info "该模块预留中，后续可随时在 GitHub 仓库内扩展。"
-        echo
-        drain_tty
-        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
+        pause_return
         ;;
       0|"")
         echo
@@ -776,18 +901,19 @@ menu_loop(){
   done
 }
 
-# 支持直接带参数静默执行，如: netflow 200 或 netflow rollback
+# 支持命令行直接带参数执行: netflow 200 | netflow status | netflow rollback
 if [ $# -gt 0 ]; then
   need_root
   take_lock
   self_install
   case "$1" in
+    status|st)      show_status ;;
     rollback|reset) rollback_origin ;;
     *)
       if is_posint "$1" 1 100000; then
         apply_tuning "$1"
       else
-        die "用法: netflow [正整数带宽 | rollback]"
+        die "用法: netflow [正整数带宽 | status | rollback]"
       fi
       ;;
   esac
