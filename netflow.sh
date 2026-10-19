@@ -5,17 +5,18 @@
 set -uo pipefail
 umask 022
 
-VERSION="1.2"
+VERSION="1.3"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
 
-# 填入你自己的 GitHub Raw 直链后，通过 bash <(curl ...) 运行也能自动安装 /usr/local/bin/netflow 快捷命令
+# GitHub Raw 直链：支持 bash <(curl ...) 运行时自动将脚本安装至 /usr/local/bin/netflow
 SELF_RAW_URL="${NETFLOW_RAW_URL:-https://raw.githubusercontent.com/muyeleng/vkit/main/netflow.sh}"
 
 STATE_DIR="/var/lib/netflow"
 SNAPSHOT="$STATE_DIR/origin.snapshot"
 SYSCTL_FILE="/etc/sysctl.d/99-netflow.conf"
+BBR_MODULE_FILE="/etc/modules-load.d/netflow-bbr.conf"
 QDISC_SCRIPT="/usr/local/sbin/netflow-qdisc.sh"
 QDISC_UNIT="/etc/systemd/system/netflow-qdisc.service"
 ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-netflow-initcwnd"
@@ -43,18 +44,28 @@ die(){  printf '  %s✕%s %s\n' "$red"   "$plain" "$1" >&2; exit "${2:-1}"; }
 rule(){ printf '  %s─────────────────────────────────────────%s\n' "$dim" "$plain"; }
 
 need_root(){ [ "$(id -u)" = 0 ] || die "请使用 root 权限运行"; }
+have_tty(){ : 2>/dev/null </dev/tty; }
 
-# 并发锁：防止多个 SSH 窗口同时运行破坏 qdisc 队列或快照
+# 字符串匹配辅助函数 (避免在 set -o pipefail 下使用 grep -q 触发 SIGPIPE 141 错误)
+has_word(){
+  case "$1" in
+    "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 并发文件锁：防止多个 SSH 窗口同时运行破坏 qdisc 队列或快照
 take_lock(){
   command -v flock >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
+  [ -w "$(dirname "$LOCK_FILE")" ] || return 0
   [ "${LOCK_HELD:-0}" = 1 ] && return 0
   exec 9>"$LOCK_FILE" || return 0
   flock -n 9 && { LOCK_HELD=1; return 0; }
   die "另一个 NetFlow 实例正在运行 (锁: $LOCK_FILE)"
 }
 
-# 清理终端输入缓冲残留，防止执行期间误触回车跳过结果页
+# 清理终端输入缓冲残留，防止执行期间误触回车直接跳过结果页
 drain_tty(){ while read -rsn1 -t 0.05 2>/dev/null </dev/tty; do :; done; return 0; }
 
 is_posint(){
@@ -76,16 +87,20 @@ human_bytes(){
   else printf '%s B' "$b"; fi
 }
 
-# 自动注册本地快捷命令: 兼容本地文件执行与 bash <(curl ...) 管道执行
+# 自动注册本地快捷命令: 兼容本地文件运行与 bash <(curl ...) 管道运行
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac
   if [ -f "$0" ] && [ -r "$0" ]; then
     cp -f "$0" "$SELF_PATH" 2>/dev/null && chmod 755 "$SELF_PATH" 2>/dev/null || true
-  elif [ -n "$SELF_RAW_URL" ] && [[ "$SELF_RAW_URL" != *"你的GitHub用户名"* ]] && command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 10 "$SELF_RAW_URL" -o "${SELF_PATH}.tmp" 2>/dev/null &&
-      grep -q '^#!/usr/bin/env bash' "${SELF_PATH}.tmp" 2>/dev/null &&
-      mv -f "${SELF_PATH}.tmp" "$SELF_PATH" && chmod 755 "$SELF_PATH" || rm -f "${SELF_PATH}.tmp"
+  elif [ -n "$SELF_RAW_URL" ] && command -v curl >/dev/null 2>&1; then
+    if curl -fsSL --max-time 10 "$SELF_RAW_URL" -o "${SELF_PATH}.tmp" 2>/dev/null &&
+       [ -s "${SELF_PATH}.tmp" ] &&
+       grep -q '^#!/usr/bin/env bash' "${SELF_PATH}.tmp" 2>/dev/null; then
+      mv -f "${SELF_PATH}.tmp" "$SELF_PATH" && chmod 755 "$SELF_PATH"
+    else
+      rm -f "${SELF_PATH}.tmp"
+    fi
   fi
 }
 
@@ -169,6 +184,7 @@ TUNED_KEYS="
   net.ipv4.tcp_adv_win_scale
   net.core.netdev_max_backlog
   net.core.netdev_budget
+  net.core.netdev_budget_usecs
   net.core.optmem_max
   net.core.somaxconn
   net.ipv4.tcp_max_syn_backlog
@@ -186,6 +202,7 @@ TUNED_KEYS="
   net.ipv4.ip_local_port_range
   vm.min_free_kbytes
   fs.file-max
+  vm.swappiness
 "
 
 take_snapshot(){
@@ -198,8 +215,8 @@ take_snapshot(){
     sysctl --system >/dev/null 2>&1 || true
   fi
   local iface tmp want got; iface=$(detect_iface)
-  tmp=$(mktemp "${SNAPSHOT}.XXXXXX" 2>/dev/null) || die "无法创建快照文件"
-  {
+  tmp=$(mktemp "${SNAPSHOT}.XXXXXX" 2>/dev/null) || die "无法创建快照文件 (只读文件系统或磁盘已满)"
+  if ! {
     echo "# netflow origin snapshot $(date -u +%FT%TZ)"
     echo "KERNEL=$(uname -r)"
     for k in $TUNED_KEYS; do
@@ -207,13 +224,15 @@ take_snapshot(){
     done
     echo "# route: $(ip -4 route show default 2>/dev/null | head -1)"
     echo "# qdisc: $(tc qdisc show dev "$iface" 2>/dev/null | head -1)"
-  } > "$tmp" || { rm -f "$tmp"; die "快照写入失败"; }
+  } > "$tmp"; then
+    rm -f "$tmp"; die "快照写入失败"
+  fi
   want=$(printf '%s\n' $TUNED_KEYS | grep -c .)
   got=$(grep -cE '^[a-z].* = ' "$tmp")
   if [ "$got" -lt "$want" ] 2>/dev/null; then
     rm -f "$tmp"; die "快照不完整 (${got}/${want} 项), 已中止"
   fi
-  mv -- "$tmp" "$SNAPSHOT"
+  mv -- "$tmp" "$SNAPSHOT" || { rm -f "$tmp"; die "快照落盘失败"; }
   ok "已备份出厂基线"
 }
 
@@ -236,7 +255,7 @@ route_set_initcwnd(){
 route_restore_windows(){
   local iface="$1"; shift
   local -a want=("$@")
-  local line t skip touched=0
+  local line t skip rc=0 touched=0
   local -a args clean
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -251,9 +270,10 @@ route_restore_windows(){
     done
     [ "${#clean[@]}" -gt 1 ] || continue
     touched=1
-    ip -4 route replace "${clean[@]}" "${want[@]+"${want[@]}"}" 2>/dev/null || return 1
+    ip -4 route replace "${clean[@]}" "${want[@]+"${want[@]}"}" 2>/dev/null || rc=1
   done <<< "$(ip -4 route show default 2>/dev/null)"
-  [ "$touched" = 1 ]
+  [ "$touched" = 1 ] || return 1
+  return "$rc"
 }
 
 networkd_manages(){
@@ -405,6 +425,28 @@ qdisc_set_mq_leaves(){
   done
 }
 
+qdisc_is_fq(){
+  local out root handle major
+  out=$(tc qdisc show dev "$1" 2>/dev/null)
+  root=$(awk '$1=="qdisc"{for(i=1;i<=NF;i++) if($i=="root"){print $2; exit}}' <<<"$out")
+  [ "$root" = fq ] && return 0
+  [ "$root" = mq ] || return 1
+  handle=$(awk '$1=="qdisc" && $2=="mq"{for(i=1;i<=NF;i++) if($i=="root"){print $3; exit}}' <<<"$out")
+  major=${handle%:}
+  [ -n "$major" ] || return 1
+  awk -v m="$major" 'BEGIN{leaves=0; bad=0}
+    $1=="qdisc" && $0 ~ / parent /{
+      for(i=1;i<=NF;i++) if($i=="parent"){
+        p=$(i+1)
+        if((m=="0" && (p ~ /^:/ || index(p,"0:")==1)) || (m!="0" && index(p,m ":")==1)){
+          leaves++; if($2!="fq") bad=1
+        }
+        break
+      }
+    }
+    END{exit !(leaves>0 && bad==0)}' <<<"$out"
+}
+
 qdisc_set_fq(){
   local iface="$1" kind
   kind=$(qdisc_root_kind "$iface")
@@ -420,6 +462,7 @@ qdisc_set_fq(){
          *)  tc qdisc replace dev "$iface" root fq 2>/dev/null || return 1 ;;
        esac ;;
   esac
+  qdisc_is_fq "$iface"
 }
 
 write_qdisc(){
@@ -427,7 +470,8 @@ write_qdisc(){
   mkdir -p "$(dirname "$QDISC_SCRIPT")"
   cat > "$QDISC_SCRIPT" <<EOF
 #!/bin/bash
-IF=\$(ip -o -4 route show default 2>/dev/null | head -1 | awk '{for(i=1;i<NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
+IF=\${NETFLOW_IF:-}
+[ -n "\$IF" ] || IF=\$(ip -o -4 route show default 2>/dev/null | head -1 | awk '{for(i=1;i<NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')
 [ -n "\$IF" ] || IF=${iface}
 RATE=\${1:-${rate}}
 BURST=\$(awk -v r="\$RATE" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%d",v}')
@@ -474,17 +518,25 @@ apply_tuning(){
   buf_def=$(calc_buf_default "$FIXED_ROLE" "$bdp")
   tcp_mem=$(calc_tcp_mem "$ram")
 
-  # 尊重现有拥塞控制 (如已安装的 XanMod BBRv3)，仅在非 bbr 时尝试加载模块
-  local cc
+  # 尊重现有 BBR 变种 (如 BBRv3)，否则加载 tcp_bbr 并持久化模块配置；若内核不支持则安全回退 cubic
+  local cc avail_cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
   if [[ "$cc" != bbr* ]]; then
     modprobe tcp_bbr 2>/dev/null || true
-    cc="bbr"
+    avail_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    if has_word "$avail_cc" bbr; then
+      cc="bbr"
+      mkdir -p "$(dirname "$BBR_MODULE_FILE")" 2>/dev/null || true
+      echo tcp_bbr > "$BBR_MODULE_FILE" 2>/dev/null || true
+    else
+      warn "当前内核不支持 BBR，回退使用 cubic"
+      cc="cubic"
+    fi
   fi
 
   local _sc_tmp
   _sc_tmp=$(mktemp "${SYSCTL_FILE}.XXXXXX" 2>/dev/null) || die "无法创建临时配置文件"
-  cat > "$_sc_tmp" <<EOF
+  if ! cat > "$_sc_tmp" <<EOF
 # Generated by NetFlow v$VERSION ($(date -u +%FT%TZ))
 # Target=${input_bw}Mbps RTT=${FIXED_RTT}ms RAM=${ram}MB
 
@@ -527,8 +579,18 @@ vm.min_free_kbytes = 32768
 fs.file-max = 1000000
 # netflow-end
 EOF
+  then
+    rm -f "$_sc_tmp"
+    die "写入 $SYSCTL_FILE 失败 (磁盘已满或配额限制)"
+  fi
 
-  chmod 644 "$_sc_tmp" && mv -- "$_sc_tmp" "$SYSCTL_FILE"
+  if ! tail -1 "$_sc_tmp" 2>/dev/null | grep -qx '# netflow-end'; then
+    rm -f "$_sc_tmp"
+    die "配置文件写入被截断，已中止"
+  fi
+  chmod 644 "$_sc_tmp" && mv -- "$_sc_tmp" "$SYSCTL_FILE" || {
+    rm -f "$_sc_tmp"; die "配置文件落盘失败"
+  }
 
   local _line _k _v _path
   while IFS= read -r _line; do
@@ -580,7 +642,7 @@ EOF
 rollback_origin(){
   local iface; iface=$(detect_iface)
   echo
-  rm -f "$SYSCTL_FILE"
+  rm -f "$SYSCTL_FILE" "$BBR_MODULE_FILE"
   remove_initcwnd_persistence
   systemctl disable --now netflow-qdisc.service >/dev/null 2>&1 || true
   rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
@@ -594,7 +656,7 @@ rollback_origin(){
       [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null || true
     done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
 
-    route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT\")
+    route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
     if [ -n "$route" ]; then
       snap_if=$(route_field dev "$route")
       read -r -a snap_args <<< "$route"
@@ -602,7 +664,7 @@ rollback_origin(){
         if [ "$snap_skip" = 1 ]; then snap_win+=("$snap_t"); snap_skip=0; continue; fi
         case "$snap_t" in initcwnd|initrwnd) snap_win+=("$snap_t"); snap_skip=1 ;; esac
       done
-      route_restore_windows "$snap_if" "${snap_win[@]+\"${snap_win[@]}\"}" 2>/dev/null || true
+      route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null || true
     fi
     ok "已按出厂基线还原内核参数与路由"
   else
@@ -665,18 +727,21 @@ show_panel(){
 
 menu_loop(){
   need_root
+  if ! have_tty; then
+    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | rollback>"
+  fi
   take_lock
   self_install
   while true; do
     show_panel
-    local choice
-    read -rp "  选择 [0-4]: " choice
+    local choice=""
+    read -rp "  选择 [0-4]: " choice 2>/dev/null </dev/tty || exit 0
     case "$choice" in
       1)
         echo
-        local bw
+        local bw=""
         while true; do
-          read -rp "  目标带宽 (Mbps): " bw
+          read -rp "  目标带宽 (Mbps): " bw 2>/dev/null </dev/tty || exit 0
           if is_posint "$bw" 1 100000; then
             apply_tuning "$bw"
             break
@@ -685,23 +750,24 @@ menu_loop(){
         done
         echo
         drain_tty
-        read -rsn1 -p "  按任意键返回..."
+        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
         ;;
       2)
         rollback_origin
         echo
         drain_tty
-        read -rsn1 -p "  按任意键返回..."
+        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
         ;;
       3|4)
         echo
         info "该模块预留中，后续可随时在 GitHub 仓库内扩展。"
         echo
         drain_tty
-        read -rsn1 -p "  按任意键返回..."
+        read -rsn1 -p "  按任意键返回..." 2>/dev/null </dev/tty || true
         ;;
       0|"")
         echo
+        drain_tty
         exit 0
         ;;
       *)
