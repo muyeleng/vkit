@@ -2,17 +2,18 @@
 # NetFlow — 确定性 TCP 吞吐优化与流控工具
 # 核心算法源自 tcpfit (v0.5.9) | 零测速依赖 · 固定 220ms 跨国 BDP 基准 · 1000Mbps 智能分流
 #
-# 日常快捷命令 (首次运行后自动注册):
+# 快捷指令:
 #   netflow                  唤出交互式主面板
-#   netflow <正整数带宽>     二次调参快捷指令：直接修改带宽与限速 (如: netflow 300)
+#   netflow <正整数带宽>     直接设定目标带宽并优化 (如: netflow 300 或 netflow 1000)
 #   netflow status           查看当前核心参数、出厂基线对比与系统健康度
 #   netflow rollback         还原出厂设置并重置基线快照
 #   netflow uninstall        彻底卸载 NetFlow (还原出厂 + 清理全部文件)
+#   netflow help             显示此帮助指南
 
 set -uo pipefail
 umask 022
 
-VERSION="1.6"
+VERSION="1.7"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
@@ -70,7 +71,6 @@ kv(){
 need_root(){ [ "$(id -u)" = 0 ] || die "请使用 root 权限运行"; }
 have_tty(){ : 2>/dev/null </dev/tty; }
 
-# 独立打印提示语并从 /dev/tty 读取，防止提示文字被吞
 prompt_input(){
   local msg="$1" var=""
   printf '%s' "$msg" >&2
@@ -86,8 +86,9 @@ pause_return(){
   echo
 }
 
-# 原生字符串匹配函数 (彻底避免在 set -o pipefail 下使用 grep -q 引发 SIGPIPE 141 错误)
+# 原生字符串匹配函数 (避免在 set -o pipefail 下使用 grep -q 引发 SIGPIPE 141 错误)
 starts_with(){ case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }
+not_blank(){ case "$1" in *[!$'\n']*) return 0 ;; *) return 1 ;; esac; }
 has_word(){
   case "$1" in
     "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
@@ -99,7 +100,6 @@ first_or(){
   if [ -n "$s" ]; then printf '%s' "$s"; else printf '%s' "$2"; fi
 }
 
-# 并发锁：防止多个 SSH 终端同时运行破坏 qdisc 队列或快照
 take_lock(){
   command -v flock >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
@@ -131,14 +131,12 @@ human_bytes(){
   else printf '%s B' "$b"; fi
 }
 
-# 自动安装或同步更新快捷命令至 /usr/local/bin/netflow
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac
   if [ -f "$0" ] && [ -r "$0" ]; then
     cp -f "$0" "$SELF_PATH" 2>/dev/null && chmod 755 "$SELF_PATH" 2>/dev/null || true
   elif [ -n "$SELF_RAW_URL" ] && command -v curl >/dev/null 2>&1; then
-    # 当本地尚未安装，或本地版本与当前运行版本不一致时，自动拉取写入
     local inst_ver=""
     [ -f "$SELF_PATH" ] && inst_ver=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$SELF_PATH" 2>/dev/null || echo "")
     if [ "$inst_ver" != "$VERSION" ]; then
@@ -151,6 +149,26 @@ self_install(){
       fi
     fi
   fi
+}
+
+# ── 帮助说明 (netflow help) ─────────────────────────────────────────────────
+usage_help(){
+  echo
+  printf "  ${bold}NetFlow${plain} — 确定性 TCP 吞吐优化与流控工具              ${dim}v%s${plain}\n" "$VERSION"
+  rule
+  printf "  ${bold}交互面板${plain}\n"
+  kv "netflow"          "唤出交互式主面板 (推荐日常使用)"
+  echo
+  printf "  ${bold}无交互快捷指令${plain}\n"
+  kv "netflow <Mbps>"   "按指定带宽计算内存并配置流控 (如: netflow 300)"
+  kv ""                 "${dim}· 输入 < 1000  : 开启 HTB 精准限速 + fq 平滑发包${plain}"
+  kv ""                 "${dim}· 输入 >= 1000 : 挂载纯 fq 队列释放多核物理满速${plain}"
+  kv "netflow status"   "查看当前核心参数、出厂基线对比与系统健康度"
+  kv "netflow rollback" "一键还原至出厂默认设置，并重置基线快照"
+  kv "netflow uninstall" "彻底卸载 NetFlow (还原出厂 + 清理全部残留文件)"
+  kv "netflow help"     "显示本帮助说明 (别名: -h, --help)"
+  rule
+  echo
 }
 
 # ── 环境检测 ────────────────────────────────────────────────────────────────
@@ -205,6 +223,17 @@ calc_buf_max(){
     if(v > cap) v = cap
     if(v < 4194304) v = 4194304
     printf "%d", v
+  }'
+}
+
+# 原版推导原因解释函数：说明缓冲区上限是由 2×BDP 决定，还是被物理内存安全预算 (RAM/32) 封顶
+buf_max_reason(){
+  awk -v b="$1" -v m="$2" -v v="$3" 'BEGIN{
+    target = b*2 + 2097152
+    cap = m*32768; if(cap > 268435456) cap = 268435456
+    if(v <= 4194304 && target < 4194304) { print "触发 4MB 保底下限"; exit }
+    if(v >= cap && target > cap)         { print "受 RAM/32 内存安全上限封顶"; exit }
+    print "2×BDP + 2MB 余量"
   }'
 }
 
@@ -265,9 +294,13 @@ snap_val(){
 
 take_snapshot(){
   mkdir -p "$STATE_DIR"
-  # 已有快照则直接返回，永久保护首次抓取的出厂原始状态
-  [ -f "$SNAPSHOT" ] && return 0
+  # 已有快照则保留最早那一份出厂状态 (与原版一致，提示用户快照已锁定)
+  if [ -f "$SNAPSHOT" ]; then
+    info "出厂快照已存在，继续保留最早的纯净基线 ($SNAPSHOT)"
+    return 0
+  fi
   if [ -f "$SYSCTL_FILE" ] || [ -f "$QDISC_SCRIPT" ]; then
+    warn "检测到已有调优配置但缺少出厂快照，正在先还原系统默认值以提取纯净基线..."
     rm -f "$SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1 || true
   fi
@@ -290,10 +323,10 @@ take_snapshot(){
     rm -f "$tmp"; die "快照不完整 (${got}/${want} 项), 已中止"
   fi
   mv -- "$tmp" "$SNAPSHOT" || { rm -f "$tmp"; die "快照落盘失败"; }
-  ok "已建立出厂基线快照 ($SNAPSHOT)"
+  ok "已建立出厂基线快照: $SNAPSHOT"
 }
 
-# ── 路由首包窗口 (initcwnd) 与静默持久化 ────────────────────────────────────
+# ── 路由首包窗口 (initcwnd) 与持久化 (含原版路径追踪) ───────────────────────
 route_set_initcwnd(){
   local n="$1" route token skip=0
   local -a args=() clean=()
@@ -350,6 +383,7 @@ networkd_manages(){
   grep -Eq 'State: [a-z-]+ \((configured|configuring)' <<< "$st"
 }
 
+INITCWND_DROPIN_PATH=""
 write_networkd_dropin(){
   local iface="$1" cw="${2:-32}" rw="${3:-32}" ver nf dir route
   ver=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')
@@ -366,6 +400,7 @@ write_networkd_dropin(){
 InitialCongestionWindow=$cw
 InitialAdvertisedReceiveWindow=$rw
 EOF
+  INITCWND_DROPIN_PATH="$dir/$INITCWND_DROPIN_NAME"
 }
 
 write_dispatcher_hook(){
@@ -436,17 +471,28 @@ remove_initcwnd_persistence(){
   done
 }
 
+INITCWND_VIA=""
 persist_initcwnd(){
   local iface="$1" val="${2:-32}"
+  INITCWND_VIA=""
   remove_initcwnd_persistence
   mkdir -p "$STATE_DIR" && : > "$INITCWND_MARKER"
   printf 'initcwnd %s initrwnd %s\n' "$val" "$val" > "$INITCWND_VALS"
   if networkd_manages "$iface"; then
-    write_networkd_dropin "$iface" "$val" "$val" && return 0
-    if write_dispatcher_hook "$iface" "$val" && dispatcher_running; then return 0; fi
+    if write_networkd_dropin "$iface" "$val" "$val"; then
+      INITCWND_VIA="systemd-networkd 配置 ($INITCWND_DROPIN_PATH)"
+      return 0
+    fi
+    if write_dispatcher_hook "$iface" "$val" && dispatcher_running; then
+      INITCWND_VIA="networkd-dispatcher 钩子"
+      return 0
+    fi
     rm -f "$ROUTE_HOOK"
   fi
-  write_initcwnd_unit "$iface" "$val" && return 0
+  if write_initcwnd_unit "$iface" "$val"; then
+    INITCWND_VIA="netflow-initcwnd.service (开机自启单元)"
+    return 0
+  fi
   return 1
 }
 
@@ -570,7 +616,7 @@ EOF
 
 # ── 功能 2: 查看状态与出厂基线对比 ──────────────────────────────────────────
 show_status(){
-  local iface; iface=$(detect_iface)
+  local iface ram; iface=$(detect_iface); ram=$(detect_ram_mb)
   local cc def_q act_q shaper rmem_max rmem_def tmem backlog cwnd svc_state
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   def_q=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
@@ -593,6 +639,15 @@ show_status(){
     orig_backlog=$(snap_val "net.core.netdev_max_backlog")
   fi
 
+  local target_bw="" buf_note=""
+  if [ -f "$SYSCTL_FILE" ]; then
+    target_bw=$(sed -n 's/^# Target=\([0-9]*\)Mbps.*/\1/p' "$SYSCTL_FILE" 2>/dev/null || echo "")
+    if [ -n "$target_bw" ]; then
+      local _bdp; _bdp=$(calc_bdp "$target_bw" "$FIXED_RTT")
+      buf_note=" · $(buf_max_reason "$_bdp" "$ram" "$rmem_max")"
+    fi
+  fi
+
   echo
   printf "  %s当前参数与出厂对比%s\n" "$bold" "$plain"
   rule
@@ -603,16 +658,14 @@ show_status(){
     local burst_kb; burst_kb=$(awk -v r="$shaper" 'BEGIN{v=r*500; if(v<32768)v=32768; printf "%.0f KB", v/1024}')
     kv "端口限速"    "${green}${shaper} Mbps${plain}  ${dim}(HTB burst ${burst_kb} · 服务 ${svc_state})${plain}"
   else
-    local target_bw=""
-    [ -f "$SYSCTL_FILE" ] && target_bw=$(sed -n 's/^# Target=\([0-9]*\)Mbps.*/\1/p' "$SYSCTL_FILE" 2>/dev/null || echo "")
     if [ -n "$target_bw" ] && [ "$target_bw" -ge "$SHAPE_MAX_BW" ] 2>/dev/null; then
       kv "端口限速"  "${green}无限制 · 纯 fq 满速释放${plain}  ${dim}(按 ${target_bw} Mbps 调优)${plain}"
     else
       kv "端口限速"  "未启用"
     fi
   fi
-  kv "最大缓冲区"    "$(human_bytes "$rmem_max")  ${dim}(初始默认 $(human_bytes "$rmem_def")${orig_rmem:+ · 出厂: ${orig_rmem}})${plain}"
-  kv "全局 TCP 内存" "${tmem}${orig_tmem:+  ${dim}(出厂: ${orig_tmem})${plain}}"
+  kv "最大缓冲区"    "$(human_bytes "$rmem_max")  ${dim}(默认 $(human_bytes "$rmem_def")${buf_note}${orig_rmem:+ · 出厂: ${orig_rmem}})${plain}"
+  kv "全局 TCP 内存" "${tmem}  ${dim}(RAM 1/16, 1/8, 1/4${orig_tmem:+ · 出厂: ${orig_tmem}})${plain}"
   kv "网卡队列上限"  "${backlog}${orig_backlog:+  ${dim}(出厂: ${orig_backlog})${plain}}"
   kv "首包窗口"      "${cwnd:-10 (系统默认)}"
   kv "出厂快照"      "$([ -f "$SNAPSHOT" ] && echo "${green}已锁定${plain} ${dim}($SNAPSHOT)${plain}" || echo "${yellow}尚未生成 (首次调优时自动建立)${plain}")"
@@ -629,12 +682,12 @@ show_status(){
   kv "累计重传率"    "${rt}  ${dim}(开机至今累计)${plain}"
   kv "限速队列丢包"  "${drops:-0}"
   kv "物理内存"      "$(free -m | awk '/Mem:/{printf "已用 %s MB / 可用 %s MB / 共 %s MB", $3, $7, $2}')"
-  kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
+  kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启 (小内存机器建议开启)"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
   kv "近 1 小时 OOM" "${oom_cnt:-0} 次"
   rule
 }
 
-# ── 功能 1: 设定带宽与优化 (含 1000Mbps 智能分流与静默兼容) ─────────────────
+# ── 功能 1: 设定带宽与优化 (完整保留原版 tcpfit 诊断提示) ──────────────────
 apply_tuning(){
   local input_bw; input_bw=$(strip_zeros "$1")
   local iface ram
@@ -644,11 +697,20 @@ apply_tuning(){
   echo
   take_snapshot
 
-  local bdp buf_max buf_def tcp_mem
+  local bdp buf_max buf_def tcp_mem bdp_mb reason_str tmem_str
   bdp=$(calc_bdp "$input_bw" "$FIXED_RTT")
   buf_max=$(calc_buf_max "$bdp" "$ram")
   buf_def=$(calc_buf_default "$FIXED_ROLE" "$bdp")
   tcp_mem=$(calc_tcp_mem "$ram")
+  bdp_mb=$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')
+  reason_str=$(buf_max_reason "$bdp" "$ram" "$buf_max")
+  tmem_str=$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')
+
+  # 原版推导过程展示：清晰交代 BDP、缓冲区上限原因 (是否触发 RAM/32 封顶) 与全局内存池
+  info "参数推导基准: 带宽 ${input_bw} Mbps / 延迟 ${FIXED_RTT} ms / 内存 ${ram} MB / 角色 ${FIXED_ROLE}"
+  printf "    %s· 理论 BDP      : %s%s\n" "$dim" "$bdp_mb" "$plain"
+  printf "    %s· 最大缓冲区    : %s (%s)%s\n" "$dim" "$(human_bytes "$buf_max")" "$reason_str" "$plain"
+  printf "    %s· 全局 TCP 内存 : %s (物理内存的 1/16, 1/8, 1/4)%s\n" "$dim" "$tmem_str" "$plain"
 
   local cc avail_cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -660,6 +722,7 @@ apply_tuning(){
       mkdir -p "$(dirname "$BBR_MODULE_FILE")" 2>/dev/null || true
       echo tcp_bbr > "$BBR_MODULE_FILE" 2>/dev/null || true
     else
+      warn "当前内核不支持 BBR，回退使用 cubic (跨国吞吐增益将显著受限)"
       cc="cubic"
     fi
   fi
@@ -722,8 +785,8 @@ EOF
     rm -f "$_sc_tmp"; die "配置文件落盘失败"
   }
 
-  # 逐项校验并在后台静默注释掉老旧内核不支持的参数，防止 systemd-sysctl 开机报错
-  local _line _k _v _path
+  # 原版内核参数逐项校验：将本机内核拒绝的项自动注释并打印明确提示，加深对当前服务器内核的认识
+  local _bad=0 _line _k _v _path
   while IFS= read -r _line; do
     case "$_line" in \#*|'') continue ;; *=*) ;; *) continue ;; esac
     _k=$(printf '%s' "${_line%%=*}" | tr -d ' \t')
@@ -731,42 +794,70 @@ EOF
     [ -n "$_k" ] || continue
     _path="/proc/sys/$(printf '%s' "$_k" | tr '.' '/')"
     if [ ! -e "$_path" ] || ! sysctl -qw "$_k=$_v" 2>/dev/null; then
-      sed -i "s%^[[:space:]]*${_k}[[:space:]]*=%# 内核不支持已注释: ${_k} =%" "$SYSCTL_FILE"
+      sed -i "s%^[[:space:]]*${_k}[[:space:]]*=%# 本内核不支持, 自动注释: ${_k} =%" "$SYSCTL_FILE"
+      warn "  内核不接受 ${_k} = ${_v} —— 已在配置中自动注释跳过"
+      _bad=$(( _bad + 1 ))
     fi
   done < "$SYSCTL_FILE"
 
-  local bdp_mb; bdp_mb=$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')
-  ok "已应用内核吞吐优化 (BDP: ${bdp_mb} -> Max Buffer: $(human_bytes "$buf_max"))"
+  if [ "$_bad" -gt 0 ]; then
+    ok "内核参数已应用: $SYSCTL_FILE (${_bad} 项被本内核拒绝已注释，不影响其余调优)"
+  else
+    ok "内核参数已全部应用: $SYSCTL_FILE"
+  fi
 
-  # 路由首包窗口: >100M 尝试开启 initcwnd 32 并静默持久化；虚拟化不支持则自动跳过
+  # 原版首包窗口 (initcwnd) 诊断与持久化路径反馈
   local _wif; _wif=$(route_field dev); [ -n "$_wif" ] || _wif="$iface"
   if [ "$input_bw" -gt 100 ]; then
     if route_set_initcwnd 32; then
-      persist_initcwnd "$_wif" 32 || true
       ok "已开启首包加速窗口 (initcwnd / initrwnd = 32)"
+      if persist_initcwnd "$_wif" 32; then
+        info "initcwnd 开机持久化: ${INITCWND_VIA}"
+      else
+        warn "initcwnd 仅在本次生效，重启后会丢失 —— 本机没有可用的持久化入口"
+        printf "    %s注意: sysctl (BBR/缓冲区) 和端口限速是持久的，仅路由首包窗口这一项重启后恢复默认。%s\n" "$dim" "$plain"
+      fi
+    else
+      if [ -z "$(ip -4 route show default 2>/dev/null)" ]; then
+        warn "initcwnd 未设置: 主路由表里没有默认路由 (可能使用了策略路由或双 /1 路由)"
+      else
+        warn "initcwnd 未生效: 当前虚拟化架构不支持修改路由窗口"
+      fi
     fi
   else
     remove_initcwnd_persistence
     route_restore_windows "$_wif" 2>/dev/null || true
-    info "小带宽保护 (<=100 Mbps): 保持默认首包窗口 (10) 防突发丢包"
+    info "小带宽保护 (<=100 Mbps): 保持内核默认首包窗口 (10)，防止首轮突发打穿小水管令牌桶"
   fi
 
+  # 方案 B 智能分流：>= 1000 Mbps 自动切换纯 fq 释放多队列极限；< 1000 Mbps 启用 HTB 精准限速
   if [ "$input_bw" -ge "$SHAPE_MAX_BW" ]; then
     systemctl disable --now netflow-qdisc.service >/dev/null 2>&1 || true
     rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
     systemctl daemon-reload >/dev/null 2>&1 || true
     qdisc_set_fq "$iface" || warn "无法在 $iface 上启用 fq"
-    ok "大带宽模式 (>=${SHAPE_MAX_BW} Mbps): 已挂载纯 fq 队列释放物理上限"
+    ok "大带宽模式 (>=${SHAPE_MAX_BW} Mbps): 已挂载纯 fq 队列释放多核物理上限 (BBR 逐连接 pacing 仍生效)"
   else
     write_qdisc "$input_bw" "$iface"
     systemctl restart netflow-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$input_bw"
     local applied
     applied=$(tc_rate_mbit "$(tc class show dev "$iface" 2>/dev/null)") || applied=""
     if [ -n "$applied" ] && awk -v a="$applied" -v r="$input_bw" 'BEGIN{exit !(a > r*0.99 && a < r*1.01)}' 2>/dev/null; then
-      ok "已锁定端口速率上限 (HTB ${applied} Mbps + fq pacing)"
+      ok "已锁定端口速率上限: HTB ${applied} Mbps + fq leaf pacing (网卡 ${iface})"
     else
-      warn "端口限速下发异常，请检查网卡状态: tc qdisc show dev $iface"
+      warn "端口限速在 ${iface} 上未生效 —— 请检查: tc qdisc show dev ${iface}"
     fi
+    if systemctl is-enabled netflow-qdisc.service >/dev/null 2>&1; then
+      ok "netflow-qdisc.service 开机自启已启用 (重启后持久生效)"
+    else
+      warn "netflow-qdisc.service 未能启用 —— 端口限速在重启后会丢失"
+    fi
+  fi
+
+  # 原版小内存无 Swap 安全提醒
+  if [ "$ram" -le 1024 ] && ! not_blank "$(swapon --show 2>/dev/null)"; then
+    echo
+    warn "本机物理内存仅 ${ram} MB 且未开启 Swap/ZRAM，高负载下建议配置 ZRAM 或 Swap 防进程被杀"
   fi
 
   show_status
@@ -789,7 +880,10 @@ rollback_origin(){
     while IFS='=' read -r k v; do
       k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
       [ -n "$k" ] && [ -n "$v" ] || continue
-      sysctl -qw "$k=$v" 2>/dev/null || true
+      if ! sysctl -qw "$k=$v" 2>/dev/null; then
+        warn "参数还原失败: $k"
+        failed=1
+      fi
     done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
 
     route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
@@ -800,18 +894,21 @@ rollback_origin(){
         if [ "$snap_skip" = 1 ]; then snap_win+=("$snap_t"); snap_skip=0; continue; fi
         case "$snap_t" in initcwnd|initrwnd) snap_win+=("$snap_t"); snap_skip=1 ;; esac
       done
-      route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null || true
+      if ! route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null; then
+        warn "默认路由窗口未完全还原"
+        failed=1
+      fi
     fi
     if [ "$failed" = 0 ]; then
       rm -f "$SNAPSHOT" 2>/dev/null || true
       ok "已按出厂基线还原全部参数，并重置基线快照"
     else
-      warn "部分文件清理异常，已保留出厂快照 ($SNAPSHOT) 供重试"
+      warn "部分参数还原异常，已保留出厂快照 ($SNAPSHOT) 供重试"
     fi
   else
     sysctl --system >/dev/null 2>&1 || true
     route_restore_windows "$iface" 2>/dev/null || true
-    warn "未找到出厂快照, 已移除配置并重载系统默认值"
+    warn "未找到出厂快照, 已移除调优文件并重载系统默认值"
   fi
 
   qdisc_remove_root "$iface" 2>/dev/null || true
@@ -871,7 +968,7 @@ show_panel(){
   printf "    4. 配置内存压缩 (ZRAM)                        ${dim}待添加${plain}\n"
   printf "    5. 系统清理与维护                             ${dim}待添加${plain}\n"
   echo
-  printf "    0. 退出\n"
+  printf "    0. 退出                              ${dim}命令行: netflow help${plain}\n"
   echo
   rule
 }
@@ -879,7 +976,7 @@ show_panel(){
 menu_loop(){
   need_root
   if ! have_tty; then
-    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | status | rollback | uninstall>"
+    die "未检测到可交互的终端。非交互环境请运行: netflow help 查看指令"
   fi
   take_lock
   self_install
@@ -936,8 +1033,14 @@ menu_loop(){
   done
 }
 
-# 支持本地二次快速调参: netflow 300 | netflow status | netflow rollback | netflow uninstall
+# 支持本地二次快速调参: netflow 300 | netflow status | netflow rollback | netflow uninstall | netflow help
 if [ $# -gt 0 ]; then
+  case "$1" in
+    -h|--help|help)
+      usage_help
+      exit 0
+      ;;
+  esac
   need_root
   take_lock
   case "$1" in
@@ -949,7 +1052,9 @@ if [ $# -gt 0 ]; then
         self_install
         apply_tuning "$1"
       else
-        die "用法: netflow [正整数带宽 | status | rollback | uninstall]"
+        warn "未知指令或无效带宽: $1"
+        usage_help
+        exit 1
       fi
       ;;
   esac
