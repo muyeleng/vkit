@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # NetFlow — 确定性 TCP 吞吐优化与流控工具
 # 核心算法源自 tcpfit (v0.5.9) | 零测速依赖 · 固定 220ms 跨国 BDP 基准 · 1000Mbps 智能分流
+#
+# 用法:
+#   netflow                  交互式管理面板 (Apple 极简风)
+#   netflow <正整数带宽>     静默执行带宽调优与流控 (如: netflow 200 或 netflow 1000)
+#   netflow status           查看当前核心参数、出厂基线对比与系统健康度
+#   netflow rollback         还原出厂设置并重置基线快照
+#   netflow uninstall        彻底卸载 NetFlow (还原出厂 + 清理全部配置与快捷命令)
 
 set -uo pipefail
 umask 022
 
-VERSION="1.4"
+VERSION="1.5"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
@@ -43,7 +50,7 @@ warn(){ printf '  %s!%s %s\n' "$yellow" "$plain" "$*" >&2; }
 die(){  printf '  %s✕%s %s\n' "$red"   "$plain" "$1" >&2; exit "${2:-1}"; }
 rule(){ printf '  %s──────────────────────────────────────────────────────%s\n' "$dim" "$plain"; }
 
-# CJK 中英文混合宽度对齐计算 (确保表格双列严丝合缝)
+# CJK 中英文混合显示宽度计算 (确保双列对齐严丝合缝，不依赖 gawk)
 _dispw(){
   printf '%s' "$1" | LC_ALL=C od -An -tu1 2>/dev/null | awk '
     {for(i=1;i<=NF;i++){b=$i
@@ -63,7 +70,7 @@ kv(){
 need_root(){ [ "$(id -u)" = 0 ] || die "请使用 root 权限运行"; }
 have_tty(){ : 2>/dev/null </dev/tty; }
 
-# 独立打印提示语并从 /dev/tty 读取，避免 2>/dev/null 吞掉 read -p 的提示文字
+# 独立打印提示语并从 /dev/tty 读取，避免重定向吞掉提示文字
 prompt_input(){
   local msg="$1" var=""
   printf '%s' "$msg" >&2
@@ -79,18 +86,20 @@ pause_return(){
   echo
 }
 
+# 原生字符串匹配函数 (彻底避免在 set -o pipefail 下使用 grep -q 引发 SIGPIPE 141 错误)
+starts_with(){ case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }
 has_word(){
   case "$1" in
     "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
     *) return 1 ;;
   esac
 }
-
 first_or(){
   local s="${1%%$'\n'*}"
   if [ -n "$s" ]; then printf '%s' "$s"; else printf '%s' "$2"; fi
 }
 
+# 并发锁：防止多个 SSH 终端同时运行破坏 qdisc 队列或快照
 take_lock(){
   command -v flock >/dev/null 2>&1 || return 0
   mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || return 0
@@ -122,6 +131,7 @@ human_bytes(){
   else printf '%s B' "$b"; fi
 }
 
+# 自动安装快捷命令至 /usr/local/bin/netflow
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac
@@ -130,7 +140,7 @@ self_install(){
   elif [ -n "$SELF_RAW_URL" ] && command -v curl >/dev/null 2>&1; then
     if curl -fsSL --max-time 10 "$SELF_RAW_URL" -o "${SELF_PATH}.tmp" 2>/dev/null &&
        [ -s "${SELF_PATH}.tmp" ] &&
-       grep -q '^#!/usr/bin/env bash' "${SELF_PATH}.tmp" 2>/dev/null; then
+       starts_with "$(head -n 1 "${SELF_PATH}.tmp" 2>/dev/null)" '#!'; then
       mv -f "${SELF_PATH}.tmp" "$SELF_PATH" && chmod 755 "$SELF_PATH"
     else
       rm -f "${SELF_PATH}.tmp"
@@ -239,7 +249,6 @@ TUNED_KEYS="
   vm.swappiness
 "
 
-# 从快照中读取指定键的原始值，用于状态对比展示
 snap_val(){
   [ -f "$SNAPSHOT" ] || return 1
   awk -F'=' -v k="$1" '
@@ -251,7 +260,7 @@ snap_val(){
 
 take_snapshot(){
   mkdir -p "$STATE_DIR"
-  # 已有快照则静默跳过，永久保护第一次抓到的出厂原始状态
+  # 已有快照则直接返回，永久保护首次抓取的出厂原始状态
   [ -f "$SNAPSHOT" ] && return 0
   if [ -f "$SYSCTL_FILE" ] || [ -f "$QDISC_SCRIPT" ]; then
     warn "检测到已有配置但缺少出厂快照，正在先还原系统默认值以提取纯净基线..."
@@ -299,7 +308,7 @@ route_set_initcwnd(){
 route_restore_windows(){
   local iface="$1"; shift
   local -a want=("$@")
-  local line t skip rc=0 touched=0
+  local line t skip rc=0 touched=0 now
   local -a args clean
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -317,6 +326,16 @@ route_restore_windows(){
     ip -4 route replace "${clean[@]}" "${want[@]+"${want[@]}"}" 2>/dev/null || rc=1
   done <<< "$(ip -4 route show default 2>/dev/null)"
   [ "$touched" = 1 ] || return 1
+  # 读回核实目标网卡路由上的窗口字段是否已确实还原
+  now=$(ip -4 route show default 2>/dev/null)
+  if [ -n "$iface" ]; then
+    now=$(printf '%s\n' "$now" | awk -v d="$iface" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; next}}')
+  fi
+  if [ "${#want[@]}" = 0 ]; then
+    case "$now" in *initcwnd*|*initrwnd*) rc=1 ;; esac
+  else
+    case "$now" in *"${want[*]}"*) ;; *) rc=1 ;; esac
+  fi
   return "$rc"
 }
 
@@ -546,7 +565,7 @@ EOF
   systemctl enable --now netflow-qdisc.service >/dev/null 2>&1
 }
 
-# ── 功能 2: 查看状态与出厂基线对比 (融合 tcpfit status + 快照对比) ──────────
+# ── 功能 2: 查看状态与出厂基线对比 ──────────────────────────────────────────
 show_status(){
   local iface; iface=$(detect_iface)
   local cc def_q act_q shaper rmem_max rmem_def tmem backlog cwnd svc_state
@@ -561,7 +580,6 @@ show_status(){
   cwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd [0-9]+' | awk '{print $2}')
   svc_state=$(systemctl is-enabled netflow-qdisc.service 2>/dev/null || echo "未安装")
 
-  # 读取出厂快照用于同行对比
   local orig_cc="" orig_rmem="" orig_tmem="" orig_backlog=""
   if [ -f "$SNAPSHOT" ]; then
     orig_cc=$(snap_val "net.ipv4.tcp_congestion_control")
@@ -594,7 +612,7 @@ show_status(){
   kv "全局 TCP 内存" "${tmem}${orig_tmem:+  ${dim}(出厂: ${orig_tmem})${plain}}"
   kv "网卡队列上限"  "${backlog}${orig_backlog:+  ${dim}(出厂: ${orig_backlog})${plain}}"
   kv "首包窗口"      "${cwnd:-10 (系统默认)}"
-  kv "出厂快照"      "$([ -f "$SNAPSHOT" ] && echo "${green}已锁定${plain} ${dim}($SNAPSHOT)${plain}" || echo "${yellow}尚未生成 (首次调优时自动备份)${plain}")"
+  kv "出厂快照"      "$([ -f "$SNAPSHOT" ] && echo "${green}已锁定${plain} ${dim}($SNAPSHOT)${plain}" || echo "${yellow}尚未生成 (首次调优时自动建立)${plain}")"
 
   echo
   printf "  %s系统健康度 (Health)%s\n" "$bold" "$plain"
@@ -602,11 +620,12 @@ show_status(){
   local snmp rt drops oom_cnt
   snmp=$(awk '/^Tcp: [0-9]/{print $12, $13}' /proc/net/snmp 2>/dev/null || echo "")
   rt=$(echo "$snmp" | awk '{if($1>0) printf "%.3f%%", $2*100/$1; else print "n/a"}')
-  drops=$(first_or "$(grep -oP 'dropped \K[0-9]+' <<<"$(tc -s class show dev "$iface" 2>/dev/null)")" "0")
+  # 使用原生 awk 提取丢包数，避免精简版系统 grep 不支持 -P (PCRE) 报错
+  drops=$(tc -s class show dev "$iface" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i~/^dropped$/){gsub(/[^0-9]/,"",$(i+1)); print $(i+1); exit}}')
   oom_cnt=$(journalctl --since '-1 hour' 2>/dev/null | grep -c 'oom-kill' || true)
 
   kv "累计重传率"    "${rt}  ${dim}(开机至今累计)${plain}"
-  kv "限速队列丢包"  "${drops}"
+  kv "限速队列丢包"  "${drops:-0}"
   kv "物理内存"      "$(free -m | awk '/Mem:/{printf "已用 %s MB / 可用 %s MB / 共 %s MB", $3, $7, $2}')"
   kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
   kv "近 1 小时 OOM" "${oom_cnt:-0} 次"
@@ -694,7 +713,7 @@ EOF
     die "写入 $SYSCTL_FILE 失败 (磁盘已满或配额限制)"
   fi
 
-  if ! tail -1 "$_sc_tmp" 2>/dev/null | grep -qx '# netflow-end'; then
+  if [ "$(tail -n 1 "$_sc_tmp" 2>/dev/null)" != "# netflow-end" ]; then
     rm -f "$_sc_tmp"
     die "配置文件写入被截断，已中止"
   fi
@@ -747,18 +766,18 @@ EOF
     fi
   fi
 
-  # 调优完成后直接展示完整状态与基线对比表
   show_status
 }
 
-# ── 功能 3: 还原出厂设置 ────────────────────────────────────────────────────
+# ── 功能 3: 还原出厂设置 (含快照安全销毁闭环) ───────────────────────────────
 rollback_origin(){
-  local iface; iface=$(detect_iface)
+  local quiet="${1:-0}"
+  local iface failed=0; iface=$(detect_iface)
   echo
-  rm -f "$SYSCTL_FILE" "$BBR_MODULE_FILE"
+  rm -f "$SYSCTL_FILE" "$BBR_MODULE_FILE" || failed=1
   remove_initcwnd_persistence
   systemctl disable --now netflow-qdisc.service >/dev/null 2>&1 || true
-  rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
+  rm -f "$QDISC_UNIT" "$QDISC_SCRIPT" || failed=1
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   if [ -f "$SNAPSHOT" ]; then
@@ -766,7 +785,8 @@ rollback_origin(){
     local -a snap_args=() snap_win=()
     while IFS='=' read -r k v; do
       k=$(echo "$k" | xargs); v=$(echo "$v" | xargs)
-      [ -n "$k" ] && [ -n "$v" ] && sysctl -qw "$k=$v" 2>/dev/null || true
+      [ -n "$k" ] && [ -n "$v" ] || continue
+      sysctl -qw "$k=$v" 2>/dev/null || true
     done < <(grep -E '^(net|vm|fs)\.' "$SNAPSHOT")
 
     route=$(awk '/^# route: /{sub(/^# route: /, ""); print; exit}' "$SNAPSHOT")
@@ -779,7 +799,13 @@ rollback_origin(){
       done
       route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null || true
     fi
-    ok "已按出厂快照 ($SNAPSHOT) 还原全部内核参数与路由"
+    if [ "$failed" = 0 ]; then
+      # 全部还原成功后销毁旧快照，使机器彻底回到“未初始化”的纯净状态
+      rm -f "$SNAPSHOT" 2>/dev/null || true
+      ok "已按出厂基线还原全部参数，并重置基线快照"
+    else
+      warn "部分文件清理异常，已保留出厂快照 ($SNAPSHOT) 供重试"
+    fi
   else
     sysctl --system >/dev/null 2>&1 || true
     route_restore_windows "$iface" 2>/dev/null || true
@@ -793,7 +819,15 @@ rollback_origin(){
     qdisc_set_mq_leaves "$iface" "$def_qdisc" 2>/dev/null || true
   fi
   ok "已移除端口流控队列，恢复出厂状态"
-  show_status
+  [ "$quiet" = 1 ] || show_status
+}
+
+# ── 隐藏式 CLI 彻底卸载功能 (netflow uninstall) ─────────────────────────────
+uninstall_self(){
+  rollback_origin 1
+  rm -rf "$STATE_DIR" "$LOCK_FILE" "$SELF_PATH" 2>/dev/null || true
+  ok "NetFlow 已彻底卸载，所有配置与快捷命令已清除"
+  echo
 }
 
 # ── 交互式主界面 (Apple 极简风) ─────────────────────────────────────────────
@@ -843,7 +877,7 @@ show_panel(){
 menu_loop(){
   need_root
   if ! have_tty; then
-    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | status | rollback>"
+    die "未检测到可交互的终端。非交互环境请直接带参数运行: netflow <带宽数字 | status | rollback | uninstall>"
   fi
   take_lock
   self_install
@@ -854,7 +888,6 @@ menu_loop(){
     case "$choice" in
       1)
         echo
-        # 仅在第一次运行（尚无快照）时显示备份说明；后续运行不再打扰
         if [ ! -f "$SNAPSHOT" ]; then
           info "首次运行：将在 $SNAPSHOT 建立出厂基线备份"
           printf "    %s后续调整带宽仅覆盖优化参数，出厂备份永久保留，随时可一键还原。%s\n\n" "$dim" "$plain"
@@ -901,19 +934,20 @@ menu_loop(){
   done
 }
 
-# 支持命令行直接带参数执行: netflow 200 | netflow status | netflow rollback
+# 支持命令行直接带参数执行: netflow 200 | netflow status | netflow rollback | netflow uninstall
 if [ $# -gt 0 ]; then
   need_root
   take_lock
-  self_install
   case "$1" in
-    status|st)      show_status ;;
-    rollback|reset) rollback_origin ;;
+    status|st)        self_install; show_status ;;
+    rollback|reset)   self_install; rollback_origin ;;
+    uninstall|remove) uninstall_self ;;
     *)
       if is_posint "$1" 1 100000; then
+        self_install
         apply_tuning "$1"
       else
-        die "用法: netflow [正整数带宽 | status | rollback]"
+        die "用法: netflow [正整数带宽 | status | rollback | uninstall]"
       fi
       ;;
   esac
