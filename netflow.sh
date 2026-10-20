@@ -13,7 +13,7 @@
 set -uo pipefail
 umask 022
 
-VERSION="1.7"
+VERSION="1.8"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
@@ -88,7 +88,6 @@ pause_return(){
 
 # 原生字符串匹配函数 (避免在 set -o pipefail 下使用 grep -q 引发 SIGPIPE 141 错误)
 starts_with(){ case "$1" in "$2"*) return 0 ;; *) return 1 ;; esac; }
-not_blank(){ case "$1" in *[!$'\n']*) return 0 ;; *) return 1 ;; esac; }
 has_word(){
   case "$1" in
     "$2"|"$2"[!A-Za-z0-9_]*|*[!A-Za-z0-9_]"$2"|*[!A-Za-z0-9_]"$2"[!A-Za-z0-9_]*) return 0 ;;
@@ -246,7 +245,7 @@ calc_buf_default(){
   esac
 }
 
-# ── 出厂基线快照 ────────────────────────────────────────────────────────────
+# ── 出厂基线快照 (纯粹聚焦 32 项网络与缓冲参数，不触碰 swappiness) ───────────
 TUNED_KEYS="
   net.core.default_qdisc
   net.ipv4.tcp_congestion_control
@@ -280,7 +279,6 @@ TUNED_KEYS="
   net.ipv4.ip_local_port_range
   vm.min_free_kbytes
   fs.file-max
-  vm.swappiness
 "
 
 snap_val(){
@@ -294,7 +292,6 @@ snap_val(){
 
 take_snapshot(){
   mkdir -p "$STATE_DIR"
-  # 已有快照则保留最早那一份出厂状态 (与原版一致，提示用户快照已锁定)
   if [ -f "$SNAPSHOT" ]; then
     info "出厂快照已存在，继续保留最早的纯净基线 ($SNAPSHOT)"
     return 0
@@ -682,12 +679,12 @@ show_status(){
   kv "累计重传率"    "${rt}  ${dim}(开机至今累计)${plain}"
   kv "限速队列丢包"  "${drops:-0}"
   kv "物理内存"      "$(free -m | awk '/Mem:/{printf "已用 %s MB / 可用 %s MB / 共 %s MB", $3, $7, $2}')"
-  kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启 (小内存机器建议开启)"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
+  kv "虚拟内存 Swap" "$(free -m | awk '/Swap:/{if($2==0) print "未开启"; else printf "已用 %s MB / 共 %s MB", $3, $2}')"
   kv "近 1 小时 OOM" "${oom_cnt:-0} 次"
   rule
 }
 
-# ── 功能 1: 设定带宽与优化 (完整保留原版 tcpfit 诊断提示) ──────────────────
+# ── 功能 1: 设定带宽与优化 (完整保留原版 tcpfit 核心诊断打印) ───────────────
 apply_tuning(){
   local input_bw; input_bw=$(strip_zeros "$1")
   local iface ram
@@ -706,7 +703,7 @@ apply_tuning(){
   reason_str=$(buf_max_reason "$bdp" "$ram" "$buf_max")
   tmem_str=$(echo "$tcp_mem" | awk '{printf "%.0fM / %.0fM / %.0fM", $1*4/1024, $2*4/1024, $3*4/1024}')
 
-  # 原版推导过程展示：清晰交代 BDP、缓冲区上限原因 (是否触发 RAM/32 封顶) 与全局内存池
+  # 原版推导过程展示
   info "参数推导基准: 带宽 ${input_bw} Mbps / 延迟 ${FIXED_RTT} ms / 内存 ${ram} MB / 角色 ${FIXED_ROLE}"
   printf "    %s· 理论 BDP      : %s%s\n" "$dim" "$bdp_mb" "$plain"
   printf "    %s· 最大缓冲区    : %s (%s)%s\n" "$dim" "$(human_bytes "$buf_max")" "$reason_str" "$plain"
@@ -785,7 +782,7 @@ EOF
     rm -f "$_sc_tmp"; die "配置文件落盘失败"
   }
 
-  # 原版内核参数逐项校验：将本机内核拒绝的项自动注释并打印明确提示，加深对当前服务器内核的认识
+  # 原版内核参数逐项校验：仅在遇到不支持的参数时打印警告并自动注释
   local _bad=0 _line _k _v _path
   while IFS= read -r _line; do
     case "$_line" in \#*|'') continue ;; *=*) ;; *) continue ;; esac
@@ -799,6 +796,10 @@ EOF
       _bad=$(( _bad + 1 ))
     fi
   done < "$SYSCTL_FILE"
+
+  if [ "$(tail -n 1 "$SYSCTL_FILE" 2>/dev/null)" != "# netflow-end" ]; then
+    die "配置文件 $SYSCTL_FILE 校验不完整，调优中止"
+  fi
 
   if [ "$_bad" -gt 0 ]; then
     ok "内核参数已应用: $SYSCTL_FILE (${_bad} 项被本内核拒绝已注释，不影响其余调优)"
@@ -835,8 +836,11 @@ EOF
     systemctl disable --now netflow-qdisc.service >/dev/null 2>&1 || true
     rm -f "$QDISC_UNIT" "$QDISC_SCRIPT"
     systemctl daemon-reload >/dev/null 2>&1 || true
-    qdisc_set_fq "$iface" || warn "无法在 $iface 上启用 fq"
-    ok "大带宽模式 (>=${SHAPE_MAX_BW} Mbps): 已挂载纯 fq 队列释放多核物理上限 (BBR 逐连接 pacing 仍生效)"
+    if qdisc_set_fq "$iface"; then
+      ok "大带宽模式 (>=${SHAPE_MAX_BW} Mbps): 已移除 HTB 上限并挂载纯 fq 队列释放物理满速"
+    else
+      warn "已移除 HTB 限速服务，但无法在 ${iface} 上挂载 fq 队列"
+    fi
   else
     write_qdisc "$input_bw" "$iface"
     systemctl restart netflow-qdisc.service 2>/dev/null || "$QDISC_SCRIPT" "$input_bw"
@@ -852,12 +856,6 @@ EOF
     else
       warn "netflow-qdisc.service 未能启用 —— 端口限速在重启后会丢失"
     fi
-  fi
-
-  # 原版小内存无 Swap 安全提醒
-  if [ "$ram" -le 1024 ] && ! not_blank "$(swapon --show 2>/dev/null)"; then
-    echo
-    warn "本机物理内存仅 ${ram} MB 且未开启 Swap/ZRAM，高负载下建议配置 ZRAM 或 Swap 防进程被杀"
   fi
 
   show_status
