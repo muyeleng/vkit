@@ -2,22 +2,22 @@
 # NetFlow — 确定性 TCP 吞吐优化与流控工具
 # 核心算法源自 tcpfit (v0.5.9) | 零测速依赖 · 固定 220ms 跨国 BDP 基准 · 1000Mbps 智能分流
 #
-# 用法:
-#   netflow                  交互式管理面板 (Apple 极简风)
-#   netflow <正整数带宽>     静默执行带宽调优与流控 (如: netflow 200 或 netflow 1000)
+# 日常快捷命令 (首次运行后自动注册):
+#   netflow                  唤出交互式主面板
+#   netflow <正整数带宽>     二次调参快捷指令：直接修改带宽与限速 (如: netflow 300)
 #   netflow status           查看当前核心参数、出厂基线对比与系统健康度
 #   netflow rollback         还原出厂设置并重置基线快照
-#   netflow uninstall        彻底卸载 NetFlow (还原出厂 + 清理全部配置与快捷命令)
+#   netflow uninstall        彻底卸载 NetFlow (还原出厂 + 清理全部文件)
 
 set -uo pipefail
 umask 022
 
-VERSION="1.5"
+VERSION="1.6"
 FIXED_RTT=220
 FIXED_ROLE="proxy"
 SHAPE_MAX_BW=1000
 
-# GitHub Raw 直链：支持 bash <(curl ...) 运行时自动将脚本安装至 /usr/local/bin/netflow
+# GitHub Raw 直链：支持 bash <(curl ...) 运行时自动安装或更新 /usr/local/bin/netflow
 SELF_RAW_URL="${NETFLOW_RAW_URL:-https://raw.githubusercontent.com/muyeleng/vkit/main/netflow.sh}"
 
 STATE_DIR="/var/lib/netflow"
@@ -70,7 +70,7 @@ kv(){
 need_root(){ [ "$(id -u)" = 0 ] || die "请使用 root 权限运行"; }
 have_tty(){ : 2>/dev/null </dev/tty; }
 
-# 独立打印提示语并从 /dev/tty 读取，避免重定向吞掉提示文字
+# 独立打印提示语并从 /dev/tty 读取，防止提示文字被吞
 prompt_input(){
   local msg="$1" var=""
   printf '%s' "$msg" >&2
@@ -131,19 +131,24 @@ human_bytes(){
   else printf '%s B' "$b"; fi
 }
 
-# 自动安装快捷命令至 /usr/local/bin/netflow
+# 自动安装或同步更新快捷命令至 /usr/local/bin/netflow
 self_install(){
   [ "$(id -u)" = 0 ] || return 0
   case "$0" in "$SELF_PATH") return 0 ;; esac
   if [ -f "$0" ] && [ -r "$0" ]; then
     cp -f "$0" "$SELF_PATH" 2>/dev/null && chmod 755 "$SELF_PATH" 2>/dev/null || true
   elif [ -n "$SELF_RAW_URL" ] && command -v curl >/dev/null 2>&1; then
-    if curl -fsSL --max-time 10 "$SELF_RAW_URL" -o "${SELF_PATH}.tmp" 2>/dev/null &&
-       [ -s "${SELF_PATH}.tmp" ] &&
-       starts_with "$(head -n 1 "${SELF_PATH}.tmp" 2>/dev/null)" '#!'; then
-      mv -f "${SELF_PATH}.tmp" "$SELF_PATH" && chmod 755 "$SELF_PATH"
-    else
-      rm -f "${SELF_PATH}.tmp"
+    # 当本地尚未安装，或本地版本与当前运行版本不一致时，自动拉取写入
+    local inst_ver=""
+    [ -f "$SELF_PATH" ] && inst_ver=$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$SELF_PATH" 2>/dev/null || echo "")
+    if [ "$inst_ver" != "$VERSION" ]; then
+      if curl -fsSL --max-time 10 "$SELF_RAW_URL" -o "${SELF_PATH}.tmp" 2>/dev/null &&
+         [ -s "${SELF_PATH}.tmp" ] &&
+         starts_with "$(head -n 1 "${SELF_PATH}.tmp" 2>/dev/null)" '#!'; then
+        mv -f "${SELF_PATH}.tmp" "$SELF_PATH" && chmod 755 "$SELF_PATH"
+      else
+        rm -f "${SELF_PATH}.tmp"
+      fi
     fi
   fi
 }
@@ -263,7 +268,6 @@ take_snapshot(){
   # 已有快照则直接返回，永久保护首次抓取的出厂原始状态
   [ -f "$SNAPSHOT" ] && return 0
   if [ -f "$SYSCTL_FILE" ] || [ -f "$QDISC_SCRIPT" ]; then
-    warn "检测到已有配置但缺少出厂快照，正在先还原系统默认值以提取纯净基线..."
     rm -f "$SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1 || true
   fi
@@ -289,7 +293,7 @@ take_snapshot(){
   ok "已建立出厂基线快照 ($SNAPSHOT)"
 }
 
-# ── 路由首包窗口 (initcwnd) 与持久化 ────────────────────────────────────────
+# ── 路由首包窗口 (initcwnd) 与静默持久化 ────────────────────────────────────
 route_set_initcwnd(){
   local n="$1" route token skip=0
   local -a args=() clean=()
@@ -326,7 +330,6 @@ route_restore_windows(){
     ip -4 route replace "${clean[@]}" "${want[@]+"${want[@]}"}" 2>/dev/null || rc=1
   done <<< "$(ip -4 route show default 2>/dev/null)"
   [ "$touched" = 1 ] || return 1
-  # 读回核实目标网卡路由上的窗口字段是否已确实还原
   now=$(ip -4 route show default 2>/dev/null)
   if [ -n "$iface" ]; then
     now=$(printf '%s\n' "$now" | awk -v d="$iface" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==d){print; next}}')
@@ -620,7 +623,6 @@ show_status(){
   local snmp rt drops oom_cnt
   snmp=$(awk '/^Tcp: [0-9]/{print $12, $13}' /proc/net/snmp 2>/dev/null || echo "")
   rt=$(echo "$snmp" | awk '{if($1>0) printf "%.3f%%", $2*100/$1; else print "n/a"}')
-  # 使用原生 awk 提取丢包数，避免精简版系统 grep 不支持 -P (PCRE) 报错
   drops=$(tc -s class show dev "$iface" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i~/^dropped$/){gsub(/[^0-9]/,"",$(i+1)); print $(i+1); exit}}')
   oom_cnt=$(journalctl --since '-1 hour' 2>/dev/null | grep -c 'oom-kill' || true)
 
@@ -632,7 +634,7 @@ show_status(){
   rule
 }
 
-# ── 功能 1: 设定带宽与优化 (含 1000Mbps 智能分流) ───────────────────────────
+# ── 功能 1: 设定带宽与优化 (含 1000Mbps 智能分流与静默兼容) ─────────────────
 apply_tuning(){
   local input_bw; input_bw=$(strip_zeros "$1")
   local iface ram
@@ -658,7 +660,6 @@ apply_tuning(){
       mkdir -p "$(dirname "$BBR_MODULE_FILE")" 2>/dev/null || true
       echo tcp_bbr > "$BBR_MODULE_FILE" 2>/dev/null || true
     else
-      warn "当前内核不支持 BBR，回退使用 cubic"
       cc="cubic"
     fi
   fi
@@ -721,6 +722,7 @@ EOF
     rm -f "$_sc_tmp"; die "配置文件落盘失败"
   }
 
+  # 逐项校验并在后台静默注释掉老旧内核不支持的参数，防止 systemd-sysctl 开机报错
   local _line _k _v _path
   while IFS= read -r _line; do
     case "$_line" in \#*|'') continue ;; *=*) ;; *) continue ;; esac
@@ -736,10 +738,11 @@ EOF
   local bdp_mb; bdp_mb=$(awk -v v="$bdp" 'BEGIN{printf "%.1f MB", v/1048576}')
   ok "已应用内核吞吐优化 (BDP: ${bdp_mb} -> Max Buffer: $(human_bytes "$buf_max"))"
 
+  # 路由首包窗口: >100M 尝试开启 initcwnd 32 并静默持久化；虚拟化不支持则自动跳过
   local _wif; _wif=$(route_field dev); [ -n "$_wif" ] || _wif="$iface"
   if [ "$input_bw" -gt 100 ]; then
     if route_set_initcwnd 32; then
-      persist_initcwnd "$_wif" 32 || warn "initcwnd 仅本次生效，未找到可用的开机持久化入口"
+      persist_initcwnd "$_wif" 32 || true
       ok "已开启首包加速窗口 (initcwnd / initrwnd = 32)"
     fi
   else
@@ -800,7 +803,6 @@ rollback_origin(){
       route_restore_windows "$snap_if" "${snap_win[@]+"${snap_win[@]}"}" 2>/dev/null || true
     fi
     if [ "$failed" = 0 ]; then
-      # 全部还原成功后销毁旧快照，使机器彻底回到“未初始化”的纯净状态
       rm -f "$SNAPSHOT" 2>/dev/null || true
       ok "已按出厂基线还原全部参数，并重置基线快照"
     else
@@ -934,7 +936,7 @@ menu_loop(){
   done
 }
 
-# 支持命令行直接带参数执行: netflow 200 | netflow status | netflow rollback | netflow uninstall
+# 支持本地二次快速调参: netflow 300 | netflow status | netflow rollback | netflow uninstall
 if [ $# -gt 0 ]; then
   need_root
   take_lock
